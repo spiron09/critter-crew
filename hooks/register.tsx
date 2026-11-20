@@ -103,6 +103,58 @@ const patch = (b: Board, id: string, fn: (a: Agent) => Agent): Board => ({
 })
 
 const anyWorking = (b: Board) => b.agents.some(a => a.state === 'working')
+const isEnded = (a: Agent) => a.state === 'done' || a.state === 'failed' || a.state === 'stopped'
+const STALE_MS = 10 * 60_000 // a working card nobody can account for for this long is let go
+
+// A name for the nth helper: the roster, then numbered once it wraps ("Bruno 2").
+const nameFor = (n: number) => `${NAMES[n % NAMES.length]}${n >= NAMES.length ? ` ${Math.floor(n / NAMES.length) + 1}` : ''}`
+
+// Where the engine says an agent stands, as a card state; undefined = still working.
+function stateOfStatus(status: string): AgentState | undefined {
+  if (status === 'completed') return 'done'
+  if (status === 'failed') return 'failed'
+  if (status === 'killed') return 'stopped'
+  if (status === 'idle') return 'resting'
+  return undefined // pending, running, waiting
+}
+
+// A helper the board never saw start (started before the mod loaded, or after a
+// reload): find it in the engine's list and give it a card.
+const unlisted = new Set<string>() // ids the engine doesn't list (workflow, engine forks): ask once
+
+async function adopt($: EngineInterface, id: string): Promise<boolean> {
+  if (unlisted.has(id)) return false
+  const info = (await $.agent.list()).find(i => i.id === id)
+  if (!info) {
+    unlisted.add(id)
+    return false
+  }
+  const t = await $.clock.now()
+  await update($, board, b => {
+    if (b.agents.some(a => a.id === id)) return b
+    const n = b.hired
+    const helper: Agent = {
+      id,
+      parent: info.parentId ?? MAIN,
+      name: info.name ?? nameFor(n),
+      critter: CRITTERS[n % CRITTERS.length]!.key,
+      role: info.type === 'general-purpose' ? 'helper' : info.type.toLowerCase(),
+      task: info.description,
+      doing: 'working',
+      state: stateOfStatus(info.status) ?? 'working',
+      model: '',
+      startedAt: t,
+      endedAt: null,
+      tools: 0,
+      tokens: 0,
+      context: 0,
+      steps: [],
+      report: '',
+    }
+    return { ...b, hired: n + 1, agents: [...b.agents, helper] }
+  })
+  return true
+}
 
 let ticker: { cancel: () => void } | null = null
 
@@ -125,26 +177,35 @@ async function syncTicker($: EngineInterface) {
 let ticks = 0
 
 // A helper that is interrupted or dies may never send its own turn.complete.
-// The engine's agent list is the truth: close any card it says has ended.
+// The engine's agent list is the truth: close any card it says has ended, rest
+// a teammate gone idle, and let go of a card nothing can account for.
 async function reconcile($: EngineInterface) {
   const b = await read($, board)
   const open = b.agents.filter(a => a.id !== MAIN && a.state === 'working')
   if (open.length === 0) return
   const live = await $.agent.list()
-  const ended = new Map<string, AgentState>()
+  const t = await $.clock.now()
+  const next = new Map<string, AgentState>()
   for (const a of open) {
     const info = live.find(i => i.id === a.id)
-    if (!info) continue
-    if (info.taskStatus === 'completed') ended.set(a.id, 'done')
-    else if (info.taskStatus === 'failed' || info.taskStatus === 'killed') ended.set(a.id, 'failed')
+    if (info) {
+      // `status`, not `taskStatus`: the task record says completed as soon as a
+      // turn ends, even while the agent still waits on background work it owns.
+      const s = stateOfStatus(info.status)
+      if (s) next.set(a.id, s)
+      continue
+    }
+    // Not listed (a workflow's or remote agent) and silent for a long while.
+    const lastSeen = Math.max(a.startedAt, ...a.steps.map(st => st.at))
+    if (t - lastSeen > STALE_MS) next.set(a.id, 'stopped')
   }
-  if (ended.size === 0) return
-  const t = await $.clock.now()
+  if (next.size === 0) return
   await update($, board, bb => ({
     ...bb,
     agents: bb.agents.map(a => {
-      const s = ended.get(a.id)
-      return s && a.state === 'working' ? { ...a, state: s, endedAt: t, doing: '' } : a
+      const s = next.get(a.id)
+      if (!s || a.state !== 'working') return a
+      return s === 'resting' ? { ...a, state: s, doing: '' } : { ...a, state: s, endedAt: t, doing: '' }
     }),
   }))
   await syncTicker($)
@@ -172,6 +233,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'crew', description: 'Open the crew board: who is working on what' })
     void $.ui.open({ id: PANE, title: 'Crew' })
+    // A reload keeps the board but not the timer: start it again if anyone works.
+    await syncTicker($)
     return next(e)
   })
 
@@ -197,12 +260,21 @@ export const register: Register = on => {
     if (started.deny !== undefined || started.agentId === undefined) return started
     const id = started.agentId
     const t = await $.clock.now()
+    // A resumed run continues under the same id: wake the same card, same critter.
+    const resumed = (await read($, board)).agents.find(a => a.id === id)
+    if (resumed) {
+      await update($, board, b =>
+        patch(b, id, a => ({ ...a, state: 'working', doing: 'picking up where it left off', endedAt: null, model: started.model || a.model })),
+      )
+      await syncTicker($)
+      return started
+    }
     await update($, board, b => {
       const n = b.hired
       const helper: Agent = {
         id,
         parent: e.parentAgentId ?? MAIN,
-        name: e.name ?? NAMES[n % NAMES.length]!,
+        name: e.name ?? nameFor(n),
         critter: CRITTERS[n % CRITTERS.length]!.key,
         role: e.subagentType === 'general-purpose' ? 'helper' : e.subagentType.toLowerCase(),
         task: e.description,
@@ -231,11 +303,14 @@ export const register: Register = on => {
     const id = e.agentId ?? MAIN
     const doing = describe(e.tool, e as unknown as Record<string, unknown>)
     const at = await $.clock.now()
-    const known = (await read($, board)).agents.some(a => a.id === id)
+    let known = (await read($, board)).agents.some(a => a.id === id)
+    if (!known && id !== MAIN) known = await adopt($, id)
+    const stepId = e.tool_use_id
     if (known) {
-      const step: Step = { at, what: doing, ok: null }
+      const step: Step = { at, what: doing, ok: null, id: stepId }
       await update($, board, b => ({
-        ...patch(b, id, a => ({ ...a, doing, tools: a.tools + 1, steps: [...a.steps, step].slice(-MAX_STEPS) })),
+        // Any tool call means it's working, whatever the card said before.
+        ...patch(b, id, a => ({ ...a, state: 'working', endedAt: null, doing, tools: a.tools + 1, steps: [...a.steps, step].slice(-MAX_STEPS) })),
         tools: b.tools + 1,
       }))
     }
@@ -243,10 +318,30 @@ export const register: Register = on => {
     if (known) {
       const ok = ran.deny === undefined && ran.isError !== true
       await update($, board, b =>
-        patch(b, id, a => ({ ...a, steps: a.steps.map(st => (st.at === at && st.ok === null ? { ...st, ok } : st)) })),
+        patch(b, id, a => ({
+          ...a,
+          steps: a.steps.map(st => ((stepId ? st.id === stepId : st.at === at) && st.ok === null ? { ...st, ok } : st)),
+        })),
       )
     }
     return ran
+  }).catch(($, e, next) => next(e))
+
+  // A new turn in a helper's loop (a resumed helper, a teammate woken by a
+  // message, a waiting helper back at work): it is working again.
+  on('turn.start', async ($, e, next) => {
+    const id = e.agentId
+    if (id) {
+      let known = (await read($, board)).agents.some(a => a.id === id)
+      if (!known) known = await adopt($, id)
+      if (known) {
+        await update($, board, b =>
+          patch(b, id, a => (a.state === 'working' ? a : { ...a, state: 'working', doing: 'thinking', endedAt: null })),
+        )
+        await syncTicker($)
+      }
+    }
+    return next(e)
   }).catch(($, e, next) => next(e))
 
   // Each model request reports its tokens: the running total and how full the context is.
@@ -271,11 +366,36 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const id = e.agentId ?? MAIN
     const t = await $.clock.now()
-    const state: AgentState = id === MAIN ? 'idle' : e.reason === 'answer' ? 'done' : 'failed'
     const before = (await read($, board)).agents.find(a => a.id === id)
-    if (before) {
-      const report = id === MAIN ? before.report : (e.answer || '').trim().slice(0, 4000)
+    if (before && id !== MAIN) {
+      const report = (e.answer || '').trim().slice(0, 4000) || before.report
+      const info = (await $.agent.list()).find(i => i.id === id)
+      // Turn over, run not over: still waiting on background work it owns (a
+      // monitor, a watched program, a plan's approval). Keep it working.
+      if (info && (info.status === 'waiting' || info.status === 'running' || info.status === 'pending')) {
+        await update($, board, b => patch(b, id, a => ({ ...a, doing: 'waiting on background work', report })))
+        await syncTicker($)
+        return next(e)
+      }
+      // A teammate between turns: resting until a message wakes it.
+      if (info && info.status === 'idle') {
+        await update($, board, b => patch(b, id, a => ({ ...a, state: 'resting', doing: '', report })))
+        await syncTicker($)
+        return next(e)
+      }
+      // Ended. Interrupted or killed is 'stopped' (not an error); an error or a
+      // refusal is 'failed'; otherwise done.
+      const state: AgentState =
+        info && stateOfStatus(info.status)
+          ? stateOfStatus(info.status)!
+          : e.reason === 'answer'
+            ? 'done'
+            : e.reason === 'aborted'
+              ? 'stopped'
+              : 'failed'
       await update($, board, b => patch(b, id, a => ({ ...a, state, endedAt: t, doing: '', report })))
+    } else if (before) {
+      await update($, board, b => patch(b, id, a => ({ ...a, state: 'idle', endedAt: t, doing: '' })))
     }
     if (id === MAIN) await reconcile($)
     // When the last helper is done, the band holds the full bar a moment, then
@@ -308,6 +428,8 @@ export const register: Register = on => {
       // Each critter says it its own way: 'Sniffed it out in 0:41'.
       if (a.state === 'done') return `${critterOf(a.critter).verb} in ${time}`
       if (a.state === 'failed') return `Got stuck after ${time}`
+      if (a.state === 'stopped') return `Stopped after ${time}`
+      if (a.state === 'resting') return 'Resting until it gets a message'
       return 'Waiting for your next ask'
     }
 
@@ -430,7 +552,7 @@ export const register: Register = on => {
       }
 
       // Terminal: the same card as text rows.
-      const mark = live ? '●' : a.state === 'done' ? '✓' : a.state === 'failed' ? '✗' : '○'
+      const mark = live ? '●' : a.state === 'done' ? '✓' : a.state === 'failed' ? '✗' : a.state === 'stopped' ? '■' : '○'
       return (
         <Box key={a.id} flexDirection="column" marginBottom={1}>
           <Box flexDirection="row" gap={1}>
@@ -483,7 +605,7 @@ export const register: Register = on => {
             <Box flexDirection="row" alignItems="center" gap="xs" flexShrink={0}>
               {[main, ...helpers].slice(0, 6).map(mate => {
                 const { Svg } = ui as typeof ui & { Svg: NonNullable<(typeof ui)['Svg']> }
-                return <Svg key={`h-${mate.id}`} source={avatarSvg(mate, 32, mate.state === 'done')} alt={mate.name} width={32} height={32} />
+                return <Svg key={`h-${mate.id}`} source={avatarSvg(mate, 32, isEnded(mate))} alt={mate.name} width={32} height={32} />
               })}
             </Box>
           </Box>
@@ -511,7 +633,8 @@ export const register: Register = on => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
     const b = await read($, board)
-    const helpers = b.agents.filter(a => a.id !== MAIN)
+    // Resting teammates aren't part of a batch's progress.
+    const helpers = b.agents.filter(a => a.id !== MAIN && a.state !== 'resting')
     const out = helpers.filter(a => a.state === 'working')
     // Read the clock only once the batch is done: a read subscribes this band,
     // and a once-a-second redraw while helpers work would replay its images.
@@ -544,7 +667,7 @@ export const register: Register = on => {
         <Box flexDirection="row" alignItems="center" gap="md">
           <Box flexDirection="row" alignItems="center" gap="xs" flexShrink={0}>
             {roster.slice(0, SHOWN).map(mate => (
-              <Svg key={mate.id} source={avatarSvg(mate, 28, mate.state === 'done')} alt={`${mate.name}, ${mate.state}`} width={28} height={28} />
+              <Svg key={mate.id} source={avatarSvg(mate, 28, isEnded(mate))} alt={`${mate.name}, ${mate.state}`} width={28} height={28} />
             ))}
             {roster.length > SHOWN && <Text size="footnote" dimColor>{`+${roster.length - SHOWN}`}</Text>}
           </Box>
@@ -558,7 +681,7 @@ export const register: Register = on => {
               hollow while it works. Counts at a glance; nothing to stretch. */}
           <Box flexDirection="row" gap="xs" flexShrink={0}>
             {roster.map(mate => (
-              <Text key={`dot-${mate.id}`} size="footnote" color={mate.state === 'failed' ? '#FB7C7F' : critterOf(mate.critter).color}>
+              <Text key={`dot-${mate.id}`} size="footnote" color={mate.state === 'failed' ? '#FB7C7F' : mate.state === 'stopped' ? INK_3 : critterOf(mate.critter).color}>
                 {mate.state === 'working' ? '○' : '●'}
               </Text>
             ))}

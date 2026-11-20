@@ -1,6 +1,9 @@
-export type AgentState = 'working' | 'idle' | 'done' | 'failed'
+// working: on a turn, or waiting on background work it owns.
+// resting: a teammate between turns, until a message wakes it.
+// done / failed / stopped: ended (stopped = interrupted or killed, not an error).
+export type AgentState = 'working' | 'idle' | 'resting' | 'done' | 'failed' | 'stopped'
 
-export type Step = { at: number; what: string; ok: boolean | null }
+export type Step = { at: number; what: string; ok: boolean | null; id?: string }
 
 export type Agent = {
   id: string

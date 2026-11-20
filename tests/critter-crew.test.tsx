@@ -56,7 +56,7 @@ test('the board tracks who works on what, then who finished or failed', async ($
   on('tool.call', () => ({ result: {} }))
   on('turn.complete', () => ({ text: '' }))
   let killed = false
-  on('agent.list', () => ({ value: killed ? [{ id: 'a3', taskStatus: 'killed' }] : [] }) as never)
+  on('agent.list', () => ({ value: killed ? [{ id: 'a3', status: 'killed', taskStatus: 'killed' }] : [] }) as never)
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await $.prompt.submit({ text: 'find the bug' } as never)
@@ -119,3 +119,35 @@ test('the board tracks who works on what, then who finished or failed', async ($
   await last.unmount()
 })
 
+test('a helper still waiting on background work stays working, then closes when it ends', async ($, on) => {
+  on('command.register', () => ({ value: { command: 'crew' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  let t = 1_000
+  on('clock.now', () => ({ value: (t += 500) }))
+  on('clock.every', () => ({ value: undefined }))
+  on('clock.after', () => ({ value: undefined }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('prompt.submit', (_, e) => e)
+  on('turn.complete', () => ({ text: '' }))
+  on('agent.spawn', () => ({ model: 'haiku', agentId: 'w1' }))
+  // The task record says completed as soon as the turn ends; the live status says waiting.
+  let status = 'waiting'
+  on('agent.list', () => ({ value: [{ id: 'w1', status, taskStatus: 'completed' }] }) as never)
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ text: 'watch the build' } as never)
+  await $.agent.spawn({ prompt: 'watch', description: 'Watch the build', subagentType: 'general-purpose' } as never)
+  await $.turn.complete({ agentId: 'w1', reason: 'answer', answer: 'watching', durationMs: 1, isAborted: false, turnId: 'w' } as never)
+
+  let ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /Waiting on background work…/ })) !== undefined).toBe(true)
+  expect((await ui.find({ type: 'Text', text: /Got stuck/ })) === undefined).toBe(true)
+  await ui.unmount()
+
+  // Once the engine says it has ended, the next check closes the card.
+  status = 'completed'
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 'm' } as never)
+  ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /Waiting on background work/ })) === undefined).toBe(true)
+  await ui.unmount()
+})

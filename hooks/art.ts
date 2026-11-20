@@ -228,7 +228,7 @@ function sprite(key: string, x: number, y: number, mood: Mood, px: number, id = 
 export type Mood = 'go' | 'zz' | 'rest' | 'sad'
 
 export const moodOf = (a: Agent): Mood =>
-  a.state === 'working' ? 'go' : a.state === 'failed' ? 'sad' : a.state === 'done' ? 'zz' : 'rest'
+  a.state === 'working' ? 'go' : a.state === 'failed' ? 'sad' : a.state === 'done' || a.state === 'stopped' ? 'zz' : 'rest'
 
 // A turn does not report its model's window: 200k, unless the model says 1M
 // or the context has already outgrown 200k, which only a 1M window allows.
