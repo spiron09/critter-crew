@@ -1,0 +1,13 @@
+{
+  "name": "critter-crew",
+  "description": "critter-crew: a live board of Claude and its subagents as pixel critters.",
+  "owner": {
+    "name": "spiron09"
+  },
+  "plugins": [
+    {
+      "name": "critter-crew",
+      "source": "./"
+    }
+  ]
+}

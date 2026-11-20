@@ -1,0 +1,7 @@
+{
+  "name": "critter-crew",
+  "version": "1.0.0",
+  "description": "A cosy live board of Claude and every subagent as pixel critters: who's working on what, how far along, and what each one did.",
+  "author": { "name": "spiron09" },
+  "types": "./types/index.d.ts"
+}
