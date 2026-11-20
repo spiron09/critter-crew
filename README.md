@@ -7,15 +7,13 @@ When Claude hands work to subagents (helpers), it's easy to lose track of who is
 - **Claude** is a clay-coloured spark ✻
 - **Every helper** gets a critter, a name and a pastel colour: a cat, fox, bunny, panda, owl or frog
 
-```
-3 on the job                                    ✻ 🐱 🦊 🐰
+<p align="center">
+  <img src="docs/crew-pane.png" alt="The Crew pane: Claude's card and three helper critters at work, each with its task, what it's doing right now, time and tokens" width="480">
+</p>
 
-╭──────────────────────────────────────────────────────────╮
-│ 🐱  Map the learning library                        0:41 │
-│     Reading index.html…                                  │
-│     bruno · explore · haiku · 53k tok          Activity  │
-╰──────────────────────────────────────────────────────────╯
-```
+<p align="center">
+  <img src="docs/crew-band.png" alt="The line above the prompt once a batch is done: three critters, '3 helpers finished', one dot per helper and the time it took" width="720">
+</p>
 
 ## What you get
 
